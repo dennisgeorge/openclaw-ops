@@ -113,9 +113,6 @@ tail -f ~/.openclaw/logs/watchdog.log
 journalctl --user -u openclaw-gateway -f
 ```
 
-## Open-Source Release Checklist
+## Author
 
-- Remove any local `~/.openclaw` state, logs, or example outputs from the repository.
-- Do not publish screenshots or pasted scan output that contain real tokens, session material, or private channel identifiers.
-- Keep examples generic: placeholder tokens, placeholder user IDs, and non-sensitive hostnames only.
-- Run `bash tests/run.sh` before publishing changes.
+[@cathrynlavery](https://twitter.com/cathrynlavery) • [founder.codes](https://founder.codes)
