@@ -124,6 +124,26 @@ openclaw status --deep
 
 **Note:** This is not a bug -- Anthropic blocked OAuth access for OpenClaw as a policy decision. The only supported method is direct API keys.
 
+#### Claude CLI Backend: Unknown Model Errors
+**Symptoms:** `FailoverError: Unknown model: claude-cli/claude-sonnet-4-6`, agents silently falling back to other providers (e.g. openai-codex), `startup model warmup failed for claude-cli/...` in gateway.err.log
+
+**Cause:** The onboarding wizard (`models auth login --provider anthropic --method cli`) sets the `cliBackends` key to `"claude"` instead of `"claude-cli"`. Since model IDs use the `claude-cli/` prefix, the gateway can't match them to any backend and treats them as unknown.
+
+**Fix:**
+```bash
+bash scripts/fix-cli-backend.sh
+```
+
+This script checks and fixes:
+1. `anthropic:claude-cli` auth profile exists
+2. `cliBackends` key is `"claude-cli"` (not `"claude"`)
+3. No `claude-cli` entry in `models.providers` (would create a broken API path)
+4. No agent-level `claude-cli` provider blocks or auth profiles
+
+**Important:** `claude-cli` is a subprocess backend, not an API provider. The gateway spawns `claude -p ...` as a child process. Never add `claude-cli` to `models.providers`.
+
+**Note:** After fixing, the `startup model warmup failed` warning in gateway.err.log is expected and non-fatal. The startup warmup uses static model resolution which doesn't check CLI backends — the runtime dispatch path handles it correctly.
+
 #### OAuth Token Refresh Failed (Non-Anthropic Providers)
 **Symptoms:** Token expired errors for non-Anthropic providers
 
