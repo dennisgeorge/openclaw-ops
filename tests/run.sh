@@ -29,7 +29,12 @@ assert_eq() {
 setup_fake_env() {
   TEST_ROOT="$(mktemp -d)"
   export TEST_ROOT
-  export HOME="$TEST_ROOT/home"
+  TEST_HOME="$TEST_ROOT/home"
+  if command -v cygpath >/dev/null 2>&1; then
+    TEST_HOME="$(cygpath -m "$TEST_HOME")"
+  fi
+  export HOME="$TEST_HOME"
+  export USERPROFILE="$TEST_HOME"
   export PATH="$TEST_ROOT/bin:$PATH"
   mkdir -p "$HOME/.openclaw/logs" "$HOME/.openclaw" "$TEST_ROOT/bin"
 
@@ -191,17 +196,31 @@ test_heal_incident_logging_no_longer_embeds_shell_generated_python() {
   grep -q "read_lines(sys.argv\\[5\\])" "$heal" || fail "heal incident logging should read manual items from a file"
 }
 
-test_security_scan_respects_maxdepth_for_permission_checks() {
+test_security_scan_detects_nested_files_and_permissions() {
   setup_fake_env
   trap teardown_fake_env RETURN
 
-  mkdir -p "$HOME/.openclaw/a/b"
-  printf 'SAFE=1\n' >"$HOME/.openclaw/a/b/too-deep.env"
-  chmod 777 "$HOME/.openclaw/a/b/too-deep.env"
+  mkdir -p "$HOME/.openclaw/nested/a/b"
+
+  cat >"$HOME/.openclaw/nested/a/b/deep-secret.jsonl" <<'EOF'
+{"token":"sk-1234567890abcdefghijklmn"}
+EOF
+
+  cat >"$HOME/.openclaw/nested/a/b/deep-worker.service" <<'EOF'
+[Unit]
+Description=Deep worker
+[Service]
+Environment=OPENCLAW_GATEWAY_TOKEN=sk-1234567890abcdefghijklmn
+EOF
+
+  chmod 777 "$HOME/.openclaw/nested/a/b/deep-secret.jsonl"
+  chmod 777 "$HOME/.openclaw/nested/a/b/deep-worker.service"
 
   local output
   output="$(bash "$ROOT_DIR/scripts/security-scan.sh" 2>&1)"
-  assert_not_contains "$output" "too-deep.env"
+  assert_contains "$output" "deep-secret.jsonl"
+  assert_contains "$output" "deep-worker.service"
+  assert_contains "$output" "has permissions"
 }
 
 test_get_openclaw_version_normalizes_missing_v_prefix() {
@@ -354,6 +373,42 @@ test_session_monitor_detects_stuck_runs() {
   assert_contains "$latest_json" "\"severity\": \"critical\""
 }
 
+test_session_monitor_detects_auth_errors_and_error_clusters_in_long_sessions() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  local session_dir="$HOME/.openclaw/agents/orion/sessions"
+  local session_file="$session_dir/session-long.jsonl"
+  local now_ts
+  now_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  mkdir -p "$session_dir"
+
+  cat >"$session_file" <<EOF
+{"type":"session","version":3,"id":"sess-long","timestamp":"$now_ts","cwd":"/tmp/long-session"}
+{"type":"message","id":"l1","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-1","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l2","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-1","toolName":"exec","content":[{"type":"text","text":"401 unauthorized"}],"isError":true,"details":{"status":"failed"}}}
+{"type":"message","id":"l3","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-2","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l4","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-2","toolName":"exec","content":[{"type":"text","text":"error: permission denied"}],"isError":true,"details":{"status":"failed"}}}
+{"type":"message","id":"l5","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-3","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l6","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-3","toolName":"exec","content":[{"type":"text","text":"error: permission denied"}],"isError":true,"details":{"status":"failed"}}}
+{"type":"message","id":"l7","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-4","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l8","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-4","toolName":"exec","content":[{"type":"text","text":"error: permission denied"}],"isError":true,"details":{"status":"failed"}}}
+EOF
+
+  for i in $(seq 1 220); do
+    printf '{"type":"message","id":"b%03d","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"Benign progress update %d"}]}}\n' "$i" "$now_ts" "$i" >>"$session_file"
+  done
+
+  bash "$ROOT_DIR/scripts/session-monitor.sh" --no-alert >/dev/null
+
+  local latest_json
+  latest_json="$(cat "$HOME/.openclaw/session-monitor/latest.json")"
+  assert_contains "$latest_json" "\"dedupeKey\": \"agent:orion:auth-error:_\""
+  assert_contains "$latest_json" "\"dedupeKey\": \"agent:orion:error-cluster:_\""
+  assert_not_contains "$latest_json" "\"dedupeKey\": \"agent:orion:retry-loop:exec\""
+}
+
 test_watchdog_throttles_session_monitor_invocation() {
   setup_fake_env
   trap teardown_fake_env RETURN
@@ -445,7 +500,7 @@ run_test() {
 run_test test_version_change_survives_watchdog_for_check_update
 run_test test_lib_removes_generic_eval_exec_helpers
 run_test test_heal_incident_logging_no_longer_embeds_shell_generated_python
-run_test test_security_scan_respects_maxdepth_for_permission_checks
+run_test test_security_scan_detects_nested_files_and_permissions
 run_test test_get_openclaw_version_normalizes_missing_v_prefix
 run_test test_health_check_passes_for_valid_targets
 run_test test_health_check_falls_back_to_etime_on_macos
@@ -454,6 +509,7 @@ run_test test_lib_time_and_sanitization_helpers
 run_test test_incident_lifecycle_and_dedup
 run_test test_session_monitor_detects_retry_loops_and_writes_latest_json
 run_test test_session_monitor_detects_stuck_runs
+run_test test_session_monitor_detects_auth_errors_and_error_clusters_in_long_sessions
 run_test test_watchdog_throttles_session_monitor_invocation
 run_test test_session_search_sanitizes_and_handles_corruption
 run_test test_session_resume_uses_compaction_and_detects_failure
