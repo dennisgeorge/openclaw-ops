@@ -42,6 +42,25 @@ assert_eq() {
   [[ "$actual" == "$expected" ]] || fail "expected [$expected], got [$actual]"
 }
 
+resolve_python_interpreter() {
+  local candidate
+  local probe
+
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      probe="$("$candidate" -c 'import sys; print(sys.version_info[0])' 2>/dev/null || true)"
+      if [[ "$probe" == "3" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+
+  fail "No working Python interpreter found"
+}
+
+PYTHON_BIN="$(resolve_python_interpreter)"
+
 setup_fake_env() {
   TEST_ROOT="$(mktemp -d)"
   export TEST_ROOT
@@ -184,7 +203,7 @@ install_fixture() {
 set_file_mtime() {
   local file="$1"
   local epoch="$2"
-  python - "$file" "$epoch" <<'PY'
+  "$PYTHON_BIN" - "$file" "$epoch" <<'PY'
 import os
 import sys
 
@@ -545,7 +564,7 @@ test_session_monitor_ignores_stale_stuck_runs() {
 
   local session_file="$HOME/.openclaw/agents/atlas/sessions/session-stuck.jsonl"
   local stale_epoch
-  stale_epoch="$(python - <<'PY'
+  stale_epoch="$("$PYTHON_BIN" - <<'PY'
 from time import time
 print(int(time()) - 172800)
 PY
