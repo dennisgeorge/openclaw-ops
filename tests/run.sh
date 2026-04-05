@@ -20,6 +20,22 @@ assert_not_contains() {
   [[ "$haystack" != *"$needle"* ]] || fail "expected output to not contain: $needle"
 }
 
+assert_line_order() {
+  local haystack="$1"
+  shift
+  local previous_line=0
+
+  for needle in "$@"; do
+    local line
+    line="$(printf '%s\n' "$haystack" | grep -nF -- "$needle" | head -n1 | cut -d: -f1 || true)"
+    [[ -n "$line" ]] || fail "expected output to contain: $needle"
+    if (( line < previous_line )); then
+      fail "expected marker order to be non-decreasing: $needle"
+    fi
+    previous_line="$line"
+  done
+}
+
 assert_eq() {
   local actual="$1"
   local expected="$2"
@@ -42,12 +58,19 @@ setup_fake_env() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${OPENCLAW_CALL_LOG:-}" ]]; then
+  printf 'openclaw|skip=%s|%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" "$*" >>"$OPENCLAW_CALL_LOG"
+fi
+
 case "${1:-}" in
   --version|-V)
     printf '%s\n' "${OPENCLAW_STATUS_VERSION:-v2026.2.12}"
     ;;
   status)
     printf 'OpenClaw %s\n' "${OPENCLAW_STATUS_VERSION:-v2026.2.12}"
+    ;;
+  health)
+    printf '{"healthy":true}\n'
     ;;
   config)
     if [[ "${2:-}" == "get" ]]; then
@@ -155,6 +178,55 @@ install_fixture() {
   cp "$ROOT_DIR/tests/fixtures/$fixture" "$HOME/.openclaw/agents/$agent/sessions/$target_name"
 }
 
+setup_post_update_stub_dir() {
+  POST_UPDATE_STUB_DIR="$TEST_ROOT/post-update-stubs"
+  mkdir -p "$POST_UPDATE_STUB_DIR"
+  cp "$ROOT_DIR/scripts/lib.sh" "$POST_UPDATE_STUB_DIR/lib.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/check-update.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'check-update|skip=%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" >>"${POST_UPDATE_STUB_LOG:?}"
+openclaw --version >/dev/null
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/check-update.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/heal.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'heal|skip=%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" >>"${POST_UPDATE_STUB_LOG:?}"
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/heal.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/security-scan.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'security-scan|skip=%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" >>"${POST_UPDATE_STUB_LOG:?}"
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/security-scan.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/openclaw_post_update_reconcile.py" <<'EOF'
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+log = Path(os.environ["POST_UPDATE_STUB_LOG"])
+with log.open("a", encoding="utf-8") as handle:
+    handle.write(f"reconcile|skip={os.environ.get('OPENCLAW_SKIP_WRAPPER_BACKUP', '0')}\n")
+
+subprocess.run(
+    ["openclaw", "gateway", "install", "--force", "--port", "18789"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/openclaw_post_update_reconcile.py"
+}
+
 teardown_fake_env() {
   rm -rf "$TEST_ROOT"
 }
@@ -221,6 +293,69 @@ EOF
   assert_contains "$output" "deep-secret.jsonl"
   assert_contains "$output" "deep-worker.service"
   assert_contains "$output" "has permissions"
+}
+
+test_post_update_skips_when_version_matches_state() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  setup_post_update_stub_dir
+
+  export OPENCLAW_CALL_LOG="$HOME/.openclaw/logs/openclaw-calls.log"
+  export POST_UPDATE_STUB_LOG="$HOME/.openclaw/logs/post-update-stub.log"
+  export OPENCLAW_POST_UPDATE_SCRIPTS_DIR="$POST_UPDATE_STUB_DIR"
+  export OPENCLAW_POST_UPDATE_STATE_FILE="$HOME/.openclaw/watchdog-state.json"
+  export OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER="$HOME/.openclaw/state/policy-guard.trigger"
+
+  mkdir -p "$(dirname "$OPENCLAW_POST_UPDATE_STATE_FILE")"
+  cat >"$OPENCLAW_POST_UPDATE_STATE_FILE" <<'EOF'
+{"current_version":"v2026.2.12","version_change_pending":false}
+EOF
+
+  local output
+  output="$(bash "$ROOT_DIR/scripts/post-update.sh" 2>&1)"
+  assert_contains "$output" "Version unchanged (v2026.2.12) — skipping post-update sequence"
+  [[ ! -f "$OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER" ]] || fail "policy guard trigger should not be touched when skipping"
+  [[ ! -f "$POST_UPDATE_STUB_LOG" ]] || fail "stub scripts should not run when version is unchanged"
+}
+
+test_post_update_runs_sequence_and_touches_policy_guard_trigger() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  setup_post_update_stub_dir
+
+  export OPENCLAW_CALL_LOG="$HOME/.openclaw/logs/openclaw-calls.log"
+  export POST_UPDATE_STUB_LOG="$HOME/.openclaw/logs/post-update-stub.log"
+  export OPENCLAW_POST_UPDATE_SCRIPTS_DIR="$POST_UPDATE_STUB_DIR"
+  export OPENCLAW_POST_UPDATE_STATE_FILE="$HOME/.openclaw/watchdog-state.json"
+  export OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER="$HOME/.openclaw/state/deep/nested/policy-guard.trigger"
+  export OPENCLAW_POST_UPDATE_RECONCILE_SCRIPT="$POST_UPDATE_STUB_DIR/openclaw_post_update_reconcile.py"
+
+  mkdir -p "$(dirname "$OPENCLAW_POST_UPDATE_STATE_FILE")"
+  cat >"$OPENCLAW_POST_UPDATE_STATE_FILE" <<'EOF'
+{"current_version":"v2026.2.11","version_change_pending":true}
+EOF
+
+  bash "$ROOT_DIR/scripts/post-update.sh" >/dev/null
+
+  local stub_log
+  stub_log="$(cat "$POST_UPDATE_STUB_LOG")"
+  assert_line_order "$stub_log" \
+    "check-update|skip=1" \
+    "heal|skip=1" \
+    "reconcile|skip=1" \
+    "security-scan|skip=1"
+
+  local call_log
+  call_log="$(cat "$OPENCLAW_CALL_LOG")"
+  assert_line_order "$call_log" \
+    "openclaw|skip=1|--version" \
+    "openclaw|skip=1|gateway install --force --port 18789" \
+    "openclaw|skip=1|health --json"
+
+  [[ -f "$OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER" ]] || fail "policy guard trigger was not created"
+  [[ -d "$(dirname "$OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER")" ]] || fail "policy guard trigger parent directory was not created"
 }
 
 test_get_openclaw_version_normalizes_missing_v_prefix() {
@@ -423,6 +558,7 @@ EOF
   export CURL_HTTP_STATUS=200
   export SESSION_MONITOR_STUB_LOG="$HOME/.openclaw/logs/session-monitor-stub.log"
   export OPENCLAW_SESSION_MONITOR_SCRIPT="$ROOT_DIR/tests/.session-monitor-stub.sh"
+  mkdir -p "$(dirname "$SESSION_MONITOR_STUB_LOG")"
 
   bash "$ROOT_DIR/scripts/watchdog.sh" >/dev/null
   bash "$ROOT_DIR/scripts/watchdog.sh" >/dev/null

@@ -22,6 +22,7 @@ This skill ships executable scripts for automated repair and continuous monitori
 | Script | Purpose |
 |--------|---------|
 | `scripts/heal.sh` | One-shot: fix gateway, auth mode, exec approvals, crons, stuck sessions |
+| `scripts/post-update.sh` | Explicit post-update orchestrator: check-update, heal, workspace reconcile, security scan, final health check, policy-guard sentinel trigger |
 | `scripts/watchdog.sh` | Runs every 5 min: HTTP health check, auto-restart, escalate after 3 failures |
 | `scripts/watchdog-install.sh` | Install watchdog as macOS LaunchAgent (survives reboots) |
 | `scripts/watchdog-uninstall.sh` | Remove the LaunchAgent |
@@ -41,6 +42,9 @@ This skill ships executable scripts for automated repair and continuous monitori
 ```bash
 # Run a one-time heal pass now:
 bash scripts/heal.sh
+
+# Run the explicit post-update hook after `openclaw update`:
+bash scripts/post-update.sh
 
 # Install the always-on watchdog (macOS):
 bash scripts/watchdog-install.sh
@@ -71,6 +75,26 @@ The watchdog follows a 3-tier escalation:
 Every heal run appends a JSONL record to `~/.openclaw/logs/heal-incidents.jsonl` so recurring issues become visible over time.
 
 When suggesting scripts to users, always show the correct path relative to wherever this skill is installed (e.g., `~/.openclaw/skills/openclaw-ops/scripts/`).
+
+### Post-update hook
+
+Use `scripts/post-update.sh` immediately after `openclaw update` or from a wrapper that wants the canonical post-update sequence.
+
+The script is idempotent: when the current OpenClaw version matches the stored watchdog state and no version change is pending, it exits before running the heavy sequence.
+
+When it does run, it executes:
+
+1. `check-update.sh --fix`
+2. `heal.sh`
+3. the workspace reconcile script if present
+4. `security-scan.sh`
+5. `openclaw health --json`
+
+On the VPS, the workspace reconcile stage refreshes model policy, auth/profile state, voice defaults, and the gateway service through `openclaw_post_update_reconcile.py` (or the equivalent systemd oneshot wrapper). If the script lives somewhere else, set `OPENCLAW_POST_UPDATE_RECONCILE_SCRIPT` (and `OPENCLAW_POST_UPDATE_RECONCILE_INTERPRETER` if needed).
+
+It then best-effort touches `~/.openclaw/state/policy-guard.trigger` after creating parent directories if needed. The VPS can wire `openclaw-policy-guard.path` to that sentinel so updates explicitly nudge the policy guard without modifying the units here.
+
+If another wrapper or automation layer launches the hook, set `OPENCLAW_SKIP_WRAPPER_BACKUP=1` so nested `openclaw` calls do not trigger backup loops.
 
 ## Session Monitoring
 
