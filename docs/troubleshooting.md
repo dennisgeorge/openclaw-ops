@@ -377,6 +377,9 @@ openclaw cron list
 
 # View run history for the job
 openclaw cron runs
+
+# Check whether agent cron jobs are missing light-context
+bash scripts/cron-optimize.sh
 ```
 
 **Common causes:**
@@ -391,6 +394,9 @@ openclaw cron run <id>
 
 # Fix timezone if needed
 openclaw cron edit <id>
+
+# Or bulk-enable light-context on agent cron jobs
+bash scripts/cron-optimize.sh --fix --level low
 ```
 
 #### Cron Webhook SSRF (Security)

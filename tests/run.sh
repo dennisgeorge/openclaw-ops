@@ -117,6 +117,58 @@ case "${1:-}" in
     printf '%s\n' "$*" >>"$HOME/.openclaw/logs/system-events.log"
     exit 0
     ;;
+  cron)
+    case "${2:-}" in
+      list)
+        if [[ "${3:-}" == "--json" || "${4:-}" == "--json" ]]; then
+          if [[ -n "${OPENCLAW_CRON_STATE_FILE:-}" && -f "${OPENCLAW_CRON_STATE_FILE:-}" ]]; then
+            cat "$OPENCLAW_CRON_STATE_FILE"
+          else
+            printf '%s\n' "${OPENCLAW_CRON_LIST_JSON:-{\"jobs\":[]}}"
+          fi
+        fi
+        exit 0
+        ;;
+      edit)
+        if [[ -n "${OPENCLAW_CRON_EDIT_LOG:-}" ]]; then
+          printf '%s\n' "$*" >>"$OPENCLAW_CRON_EDIT_LOG"
+        fi
+        if [[ -n "${OPENCLAW_CRON_STATE_FILE:-}" && -f "${OPENCLAW_CRON_STATE_FILE:-}" ]]; then
+          python3 - "$OPENCLAW_CRON_STATE_FILE" "$@" <<'PY'
+import json
+import sys
+
+state_file = sys.argv[1]
+args = sys.argv[2:]
+job_id = args[2]
+light = "--light-context" in args
+thinking = None
+if "--thinking" in args:
+    idx = args.index("--thinking")
+    if idx + 1 < len(args):
+        thinking = args[idx + 1]
+
+with open(state_file, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+jobs = payload.get("jobs", [])
+for job in jobs:
+    if job.get("id") != job_id:
+        continue
+    job.setdefault("payload", {})
+    if light:
+        job["payload"]["lightContext"] = True
+    if thinking is not None:
+        job["payload"]["thinking"] = thinking
+
+with open(state_file, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle)
+PY
+        fi
+        exit 0
+        ;;
+    esac
+    ;;
   doctor|gateway|cron|approvals)
     exit 0
     ;;
@@ -772,6 +824,97 @@ PY
   assert_contains "$empty_json" "\"affected_agents\": 0"
 }
 
+test_cron_optimize_reports_and_fixes_missing_light_context() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  export OPENCLAW_CRON_STATE_FILE="$HOME/.openclaw/cron-state.json"
+  export OPENCLAW_CRON_EDIT_LOG="$HOME/.openclaw/logs/cron-edit.log"
+
+  python3 - "$OPENCLAW_CRON_STATE_FILE" <<'PY'
+import json
+import sys
+
+payload = {
+    "jobs": [
+        {
+            "id": "job-1",
+            "agentId": "atlas",
+            "name": "Atlas morning report",
+            "schedule": {"kind": "cron", "expr": "0 8 * * *", "tz": "America/Chicago"},
+            "payload": {"kind": "agentTurn", "message": "hi", "lightContext": False},
+        },
+        {
+            "id": "job-2",
+            "agentId": "atlas",
+            "name": "Atlas already optimized",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *", "tz": "America/Chicago"},
+            "payload": {"kind": "agentTurn", "message": "hi", "lightContext": True, "thinking": "high"},
+        },
+        {
+            "id": "job-3",
+            "agentId": "scout",
+            "name": "Scout no thinking yet",
+            "schedule": {"kind": "cron", "expr": "0 10 * * *", "tz": "America/Chicago"},
+            "payload": {"kind": "agentTurn", "message": "hi", "lightContext": False},
+        },
+        {
+            "id": "job-4",
+            "agentId": "ops",
+            "name": "System event",
+            "schedule": {"kind": "cron", "expr": "0 11 * * *", "tz": "America/Chicago"},
+            "payload": {"kind": "systemEvent", "systemEvent": "noop"},
+        },
+    ]
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle)
+PY
+
+  local output status
+  set +e
+  output="$(bash "$ROOT_DIR/scripts/cron-optimize.sh" 2>&1)"
+  status=$?
+  set -e
+  assert_eq "$status" "1"
+  assert_contains "$output" "agent"
+  assert_contains "$output" "job-1"
+  assert_contains "$output" "job-2"
+  assert_contains "$output" "job-3"
+  assert_contains "$output" "Optimizations available: 2 of 3 agent cron jobs are missing --light-context."
+
+  local atlas_output atlas_status
+  set +e
+  atlas_output="$(bash "$ROOT_DIR/scripts/cron-optimize.sh" --agent atlas 2>&1)"
+  atlas_status=$?
+  set -e
+  assert_eq "$atlas_status" "1"
+  assert_contains "$atlas_output" "job-1"
+  assert_contains "$atlas_output" "job-2"
+  assert_not_contains "$atlas_output" "job-3"
+
+  local fix_output fix_status
+  set +e
+  fix_output="$(bash "$ROOT_DIR/scripts/cron-optimize.sh" --fix --level minimal 2>&1)"
+  fix_status=$?
+  set -e
+  assert_eq "$fix_status" "0"
+  assert_contains "$fix_output" "Applying fixes"
+  assert_contains "$fix_output" "Cron optimized: job-1"
+  assert_contains "$fix_output" "Cron optimized: job-3"
+  assert_contains "$fix_output" "All 3 listed agent cron jobs already use --light-context."
+
+  local edit_log
+  edit_log="$(cat "$OPENCLAW_CRON_EDIT_LOG")"
+  assert_contains "$edit_log" "cron edit job-1 --light-context --thinking minimal"
+  assert_contains "$edit_log" "cron edit job-3 --light-context --thinking minimal"
+  assert_not_contains "$edit_log" "job-2"
+
+  local post_fix
+  post_fix="$(bash "$ROOT_DIR/scripts/cron-optimize.sh" 2>&1)"
+  assert_contains "$post_fix" "All 3 listed agent cron jobs already use --light-context."
+}
+
 test_daily_digest_summarizes_incidents_activity_and_watchdog() {
   setup_fake_env
   trap teardown_fake_env RETURN
@@ -818,5 +961,6 @@ run_test test_watchdog_throttles_session_monitor_invocation
 run_test test_session_search_sanitizes_and_handles_corruption
 run_test test_session_resume_uses_compaction_and_detects_failure
 run_test test_prompt_truncation_report_handles_latest_session_and_json_output
+run_test test_cron_optimize_reports_and_fixes_missing_light_context
 run_test test_daily_digest_summarizes_incidents_activity_and_watchdog
 printf 'All openclaw-ops tests passed\n'
