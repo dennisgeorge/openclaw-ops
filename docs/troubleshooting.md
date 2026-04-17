@@ -534,6 +534,15 @@ bash scripts/prompt-truncation-report.sh --agent atlas --json
 
 If this reports truncated or near-limit files, the problem is usually prompt assembly or oversized bootstrap files, not gateway liveness.
 
+#### Unconfigured Agent Directories Piling Up
+**Symptoms:** `~/.openclaw/agents/` contains old agent dirs that are no longer configured, and you want to separate safe archive/delete candidates from recent dirs that still need inspection.
+
+**Diagnose / act:**
+```bash
+bash scripts/agent-dirs-audit.sh
+bash scripts/agent-dirs-audit.sh --archive --delete-empty
+```
+
 #### Disk Space Growing from Sessions
 **Symptoms:** `~/.openclaw/agents/` directory consuming excessive disk
 

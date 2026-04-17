@@ -1003,6 +1003,66 @@ PY
   assert_contains "$none" "No erroring cron jobs found for agent scout with consecutiveErrors >= 2."
 }
 
+test_agent_dirs_audit_classifies_and_mutates_candidates() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  mkdir -p "$HOME/.openclaw/agents"
+  cat >"$HOME/.openclaw/openclaw.json" <<'EOF'
+{
+  "agents": {
+    "list": [
+      {"id": "atlas"},
+      {"id": "porter"}
+    ]
+  }
+}
+EOF
+
+  mkdir -p "$HOME/.openclaw/agents/atlas/sessions"
+  mkdir -p "$HOME/.openclaw/agents/orphan-empty/sessions"
+  mkdir -p "$HOME/.openclaw/agents/orphan-dormant/sessions"
+  mkdir -p "$HOME/.openclaw/agents/orphan-dormant/agent"
+  mkdir -p "$HOME/.openclaw/agents/orphan-recent/sessions"
+  mkdir -p "$HOME/.openclaw/agents/scaffold"
+
+  printf '{}' >"$HOME/.openclaw/agents/orphan-dormant/agent/auth-profiles.json"
+  printf 'old session\n' >"$HOME/.openclaw/agents/orphan-dormant/sessions/old.jsonl"
+  printf 'recent session\n' >"$HOME/.openclaw/agents/orphan-recent/sessions/recent.jsonl"
+
+  local now
+  now="$(date +%s)"
+  set_file_mtime "$HOME/.openclaw/agents/orphan-dormant/sessions/old.jsonl" "$((now - 40 * 86400))"
+  set_file_mtime "$HOME/.openclaw/agents/orphan-dormant/agent/auth-profiles.json" "$((now - 40 * 86400))"
+  set_file_mtime "$HOME/.openclaw/agents/orphan-dormant/agent" "$((now - 40 * 86400))"
+  set_file_mtime "$HOME/.openclaw/agents/orphan-dormant/sessions" "$((now - 40 * 86400))"
+  set_file_mtime "$HOME/.openclaw/agents/orphan-dormant" "$((now - 40 * 86400))"
+
+  local output
+  output="$(bash "$ROOT_DIR/scripts/agent-dirs-audit.sh" 2>&1)"
+  assert_contains "$output" "orphan-empty"
+  assert_contains "$output" "EMPTY"
+  assert_contains "$output" "orphan-dormant"
+  assert_contains "$output" "DORMANT"
+  assert_contains "$output" "orphan-recent"
+  assert_contains "$output" "RECENT"
+  assert_contains "$output" "scaffold"
+  assert_contains "$output" "SKIP-PARTIAL"
+  assert_not_contains "$output" "atlas"
+  assert_contains "$output" "DRY RUN — no directories moved or deleted."
+
+  local mutate_output
+  mutate_output="$(bash "$ROOT_DIR/scripts/agent-dirs-audit.sh" --archive --delete-empty 2>&1)"
+  assert_contains "$mutate_output" "Deleted empty dir: orphan-empty"
+  assert_contains "$mutate_output" "Archived dormant dir: orphan-dormant"
+
+  [[ ! -d "$HOME/.openclaw/agents/orphan-empty" ]] || fail "expected orphan-empty to be deleted"
+  [[ ! -d "$HOME/.openclaw/agents/orphan-dormant" ]] || fail "expected orphan-dormant to be archived"
+  [[ -d "$HOME/.openclaw/agents/orphan-recent" ]] || fail "expected orphan-recent to remain"
+  [[ -d "$HOME/.openclaw/agents/scaffold" ]] || fail "expected scaffold to remain"
+  [[ -d "$HOME/.openclaw/agents/_archived/$(date +%F)/orphan-dormant" ]] || fail "expected orphan-dormant archive dir"
+}
+
 test_daily_digest_summarizes_incidents_activity_and_watchdog() {
   setup_fake_env
   trap teardown_fake_env RETURN
@@ -1051,5 +1111,6 @@ run_test test_session_resume_uses_compaction_and_detects_failure
 run_test test_prompt_truncation_report_handles_latest_session_and_json_output
 run_test test_cron_optimize_reports_and_fixes_missing_light_context
 run_test test_cron_error_inspector_formats_erroring_jobs
+run_test test_agent_dirs_audit_classifies_and_mutates_candidates
 run_test test_daily_digest_summarizes_incidents_activity_and_watchdog
 printf 'All openclaw-ops tests passed\n'
